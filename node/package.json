@@ -1,0 +1,21 @@
+{
+  "name": "site-scraper",
+  "version": "1.0.0",
+  "description": "Crawl every page of a website and export everything to one folder.",
+  "type": "module",
+  "main": "site_scraper.js",
+  "bin": {
+    "site-scraper": "site_scraper.js"
+  },
+  "scripts": {
+    "start": "node site_scraper.js"
+  },
+  "engines": {
+    "node": ">=20.18.1"
+  },
+  "license": "MIT",
+  "dependencies": {
+    "cheerio": "^1.2.0",
+    "robots-parser": "^3.0.1"
+  }
+}
