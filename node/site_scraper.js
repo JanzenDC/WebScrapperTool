@@ -38,6 +38,8 @@ const ASSET_EXTENSIONS = new Set([
   ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico",
   ".woff", ".woff2", ".ttf", ".pdf",
 ]);
+const RETRY_STATUSES = new Set([429, 500, 502, 503, 504]);
+const MAX_RETRY_AFTER = 300;
 
 
 // --------------------------------------------------------------------------- //
@@ -134,6 +136,12 @@ function errorMessage(e) {
   return msg.slice(0, 200);
 }
 
+/** Seconds from a numeric Retry-After header, capped, or null. */
+function retryAfter(res) {
+  const s = Number(res.headers.get("retry-after") ?? NaN);
+  return Number.isFinite(s) ? Math.min(Math.max(s, 0), MAX_RETRY_AFTER) : null;
+}
+
 function csvCell(value) {
   const s = value == null ? "" : String(value);
   return /[",\r\n]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
@@ -173,16 +181,45 @@ class SiteScraper {
     this.records = [];
     this.errors = [];
     this.seenAssets = new Set();
+    this.cooldownUntil = 0;
     this.includeRe = args.include ? new RegExp(args.include) : null;
     this.excludeRe = args.exclude ? new RegExp(args.exclude) : null;
   }
 
-  get(url) {
-    return fetch(url, {
-      headers: { "User-Agent": this.args.userAgent },
-      redirect: "follow",
-      signal: AbortSignal.timeout(this.args.timeout * 1000),
-    });
+  // ---- requests with retry ------------------------------------------- //
+  /** GET url. Connection errors, timeouts, 429 and 5xx pause every worker, then retry. */
+  async request(url) {
+    for (let attempt = 0; ; attempt++) {
+      await this.waitForCooldown();
+      const backoff = this.args.retryWait * 2 ** attempt;
+      let res;
+      try {
+        res = await fetch(url, {
+          headers: { "User-Agent": this.args.userAgent },
+          redirect: "follow",
+          signal: AbortSignal.timeout(this.args.timeout * 1000),
+        });
+      } catch (e) {
+        if (attempt >= this.args.retries) throw e;
+        this.startCooldown(backoff, url, e.cause?.code || e.name);
+        continue;
+      }
+      if (!RETRY_STATUSES.has(res.status) || attempt >= this.args.retries) return res;
+      await res.body?.cancel();
+      this.startCooldown(retryAfter(res) || backoff, url, `HTTP ${res.status}`);
+    }
+  }
+
+  async waitForCooldown() {
+    let remaining;
+    while ((remaining = this.cooldownUntil - Date.now()) > 0) await sleep(remaining);
+  }
+
+  startCooldown(seconds, url, reason) {
+    const until = Date.now() + seconds * 1000;
+    if (until <= this.cooldownUntil) return;
+    this.cooldownUntil = until;
+    console.log(`[retry] ${reason} on ${url}; pausing all requests for ${Math.round(seconds)}s`);
   }
 
   // ---- setup ---------------------------------------------------------- //
@@ -190,7 +227,7 @@ class SiteScraper {
     if (!this.args.respectRobots) return;
     const robotsUrl = new URL("/robots.txt", this.startUrl).href;
     try {
-      const res = await this.get(robotsUrl);
+      const res = await this.request(robotsUrl);
       if (res.status === 200) {
         this.robots = robotsParser(robotsUrl, await res.text());
         console.log(`[robots] loaded ${robotsUrl}`);
@@ -214,7 +251,7 @@ class SiteScraper {
       visited.add(sm);
       let xml;
       try {
-        const res = await this.get(sm);
+        const res = await this.request(sm);
         if (res.status !== 200) {
           await res.body?.cancel();
           continue;
@@ -260,7 +297,7 @@ class SiteScraper {
       assets: [], error: "",
     };
     try {
-      const res = await this.get(url);
+      const res = await this.request(url);
       rec.status = res.status;
       rec.content_type = res.headers.get("content-type") || "";
       if (res.status !== 200 || !rec.content_type.toLowerCase().includes("html")) {
@@ -291,7 +328,8 @@ class SiteScraper {
       }
 
       // Collect links
-      const base = res.url;
+      const baseHref = $("base[href]").first().attr("href");
+      const base = (baseHref && resolveUrl(baseHref.trim(), res.url)) || res.url;
       $("a[href]").each((_, a) => {
         const href = $(a).attr("href").trim();
         if (/^(mailto|tel|javascript|data):/i.test(href)) return;
@@ -333,7 +371,7 @@ class SiteScraper {
     if (this.seenAssets.has(clean)) return;
     this.seenAssets.add(clean);
     try {
-      const res = await this.get(clean);
+      const res = await this.request(clean);
       if (res.status !== 200) {
         await res.body?.cancel();
         return;
@@ -452,6 +490,8 @@ options:
   --workers N            Parallel downloads (default: 5)
   --delay SECONDS        Seconds each worker waits after a request (default: 0.5)
   --timeout SECONDS      Request timeout in seconds (default: 20)
+  --retries N            Retries after a connection error, timeout, 429 or 5xx (default: 3)
+  --retry-wait SECONDS   Seconds to pause before the first retry, doubled each time (default: 30)
   --text                 Also export clean plain text of each page
   --assets               Also download images, CSS, JS, PDFs
   --external-assets      Allow assets from other domains (CDNs)
@@ -507,6 +547,8 @@ async function parseCli() {
         workers: { type: "string", default: "5" },
         delay: { type: "string", default: "0.5" },
         timeout: { type: "string", default: "20" },
+        retries: { type: "string", default: "3" },
+        "retry-wait": { type: "string", default: "30" },
         text: { type: "boolean", default: false },
         assets: { type: "boolean", default: false },
         "external-assets": { type: "boolean", default: false },
@@ -536,6 +578,8 @@ async function parseCli() {
     workers: toNumber("--workers", v.workers, { min: 1 }),
     delay: toNumber("--delay", v.delay, { integer: false, min: 0 }),
     timeout: toNumber("--timeout", v.timeout, { integer: false, min: 0 }),
+    retries: toNumber("--retries", v.retries, { min: 0 }),
+    retryWait: toNumber("--retry-wait", v["retry-wait"], { integer: false, min: 0 }),
     text: v.text,
     assets: v.assets,
     externalAssets: v["external-assets"],

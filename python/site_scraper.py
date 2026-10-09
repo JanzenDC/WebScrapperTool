@@ -27,6 +27,7 @@ import hashlib
 import json
 import re
 import sys
+import threading
 import time
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
@@ -45,6 +46,8 @@ ASSET_EXTENSIONS = {
     ".css", ".js", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".webp", ".ico",
     ".woff", ".woff2", ".ttf", ".pdf",
 }
+RETRY_STATUSES = {429, 500, 502, 503, 504}
+MAX_RETRY_AFTER = 300
 
 
 # --------------------------------------------------------------------------- #
@@ -90,6 +93,14 @@ def url_to_relpath(url: str, suffix: str) -> Path:
     return Path(name + suffix)
 
 
+def retry_after(resp):
+    """Seconds from a numeric Retry-After header, capped, or None."""
+    try:
+        return min(max(float(resp.headers.get("Retry-After", "")), 0.0), MAX_RETRY_AFTER)
+    except ValueError:
+        return None
+
+
 # --------------------------------------------------------------------------- #
 # Crawler
 # --------------------------------------------------------------------------- #
@@ -109,8 +120,43 @@ class SiteScraper:
         self.records = []
         self.errors = []
         self.seen_assets = set()
+        self.cooldown_lock = threading.Lock()
+        self.cooldown_until = 0.0
         self.include_re = re.compile(args.include) if args.include else None
         self.exclude_re = re.compile(args.exclude) if args.exclude else None
+
+    # ---- requests with retry ------------------------------------------- #
+    def request(self, url):
+        """GET url. Connection errors, timeouts, 429 and 5xx pause every worker, then retry."""
+        for attempt in range(self.args.retries + 1):
+            self.wait_for_cooldown()
+            backoff = self.args.retry_wait * 2 ** attempt
+            try:
+                resp = self.session.get(url, timeout=self.args.timeout)
+            except (requests.ConnectionError, requests.Timeout) as e:
+                if attempt == self.args.retries:
+                    raise
+                self.start_cooldown(backoff, url, type(e).__name__)
+                continue
+            if resp.status_code not in RETRY_STATUSES or attempt == self.args.retries:
+                return resp
+            self.start_cooldown(retry_after(resp) or backoff, url, f"HTTP {resp.status_code}")
+
+    def wait_for_cooldown(self):
+        while True:
+            with self.cooldown_lock:
+                remaining = self.cooldown_until - time.monotonic()
+            if remaining <= 0:
+                return
+            time.sleep(remaining)
+
+    def start_cooldown(self, seconds, url, reason):
+        with self.cooldown_lock:
+            until = time.monotonic() + seconds
+            if until <= self.cooldown_until:
+                return
+            self.cooldown_until = until
+        print(f"[retry] {reason} on {url}; pausing all requests for {seconds:.0f}s")
 
     # ---- setup ---------------------------------------------------------- #
     def load_robots(self):
@@ -120,7 +166,7 @@ class SiteScraper:
         robots_url = f"{parsed.scheme}://{parsed.netloc}/robots.txt"
         rp = robotparser.RobotFileParser()
         try:
-            resp = self.session.get(robots_url, timeout=self.args.timeout)
+            resp = self.request(robots_url)
             if resp.status_code == 200:
                 rp.parse(resp.text.splitlines())
                 self.robots = rp
@@ -142,7 +188,7 @@ class SiteScraper:
                 continue
             visited.add(sm)
             try:
-                r = self.session.get(sm, timeout=self.args.timeout)
+                r = self.request(sm)
                 if r.status_code != 200:
                     continue
                 tree = ET.fromstring(r.content)
@@ -187,7 +233,7 @@ class SiteScraper:
             "assets": [], "error": "",
         }
         try:
-            resp = self.session.get(url, timeout=self.args.timeout, allow_redirects=True)
+            resp = self.request(url)
             rec["status"] = resp.status_code
             rec["content_type"] = resp.headers.get("Content-Type", "")
             if resp.status_code != 200 or "html" not in rec["content_type"].lower():
@@ -222,6 +268,9 @@ class SiteScraper:
 
             # Collect links
             base = resp.url
+            base_tag = soup.find("base", href=True)
+            if base_tag:
+                base = urljoin(resp.url, base_tag["href"].strip())
             for a in soup.find_all("a", href=True):
                 href = a["href"].strip()
                 if href.startswith(("mailto:", "tel:", "javascript:", "data:")):
@@ -258,7 +307,7 @@ class SiteScraper:
             return
         self.seen_assets.add(clean)
         try:
-            r = self.session.get(clean, timeout=self.args.timeout)
+            r = self.request(clean)
             if r.status_code != 200:
                 return
             ap = urlparse(clean)
@@ -352,6 +401,10 @@ def parse_args():
     ap.add_argument("--workers", type=int, default=5, help="Parallel downloads (default: 5)")
     ap.add_argument("--delay", type=float, default=0.5, help="Seconds each worker waits after a request (default: 0.5)")
     ap.add_argument("--timeout", type=int, default=20, help="Request timeout in seconds (default: 20)")
+    ap.add_argument("--retries", type=int, default=3,
+                    help="Retries after a connection error, timeout, 429 or 5xx (default: 3)")
+    ap.add_argument("--retry-wait", type=float, default=30,
+                    help="Seconds to pause before the first retry, doubled each time (default: 30)")
     ap.add_argument("--text", action="store_true", help="Also export clean plain text of each page")
     ap.add_argument("--assets", action="store_true", help="Also download images, CSS, JS, PDFs")
     ap.add_argument("--external-assets", action="store_true", help="Allow assets from other domains (CDNs)")
@@ -363,6 +416,8 @@ def parse_args():
                     help="Ignore robots.txt (only use on sites you own / have permission for)")
     ap.add_argument("--user-agent", default="Mozilla/5.0 (compatible; SiteScraper/1.0)", help="User-Agent header")
     args = ap.parse_args()
+    if args.retries < 0 or args.retry_wait < 0:
+        ap.error("--retries and --retry-wait must not be negative")
 
     while not args.url:
         args.url = input("Target URL: ").strip()

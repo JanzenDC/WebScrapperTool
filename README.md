@@ -20,7 +20,9 @@ WebScrapperTool/
 
 ## Windows launcher
 
-On Windows, double-click `run.bat` or run it from a terminal. It checks which runtimes are installed and shows them in green. The recommended one (Python if both are installed) is marked and runs if you just press Enter. Any missing dependencies are installed automatically before the scraper starts.
+On Windows, double-click `run.bat` or run it from a terminal. It checks which runtimes are installed and shows them in green. The recommended one (Python if both are installed) is marked and runs if you just press Enter. If Node.js is installed, the launcher checks `node\node_modules` as soon as it opens and runs `npm install` if any module from `node\package.json` is missing. Missing Python packages are installed when you choose Python.
+
+If Python isn't installed, choosing 1 offers to install Python 3.13 for your user account. No admin rights are needed. The launcher uses `winget` if it's available, and otherwise downloads the official installer from python.org. Once it finishes, the scraper starts right away; you don't need to restart the launcher.
 
 ```
   [1] Python    installed, Python 3.12.0  (recommended)
@@ -109,6 +111,8 @@ python site_scraper.py https://example.com --assets --external-assets
 | `--workers` | `5` | Number of parallel downloads |
 | `--delay` | `0.5` | Seconds each worker waits after a request |
 | `--timeout` | `20` | Request timeout in seconds |
+| `--retries` | `3` | How many times to retry after a connection error, timeout, HTTP 429 or 5xx |
+| `--retry-wait` | `30` | Seconds to pause before the first retry, doubled each time (30s, 60s, 120s). A `Retry-After` header from the server takes priority |
 | `--text` | off | Also export clean plain text of each page |
 | `--assets` | off | Also download images, CSS, JS, fonts and PDFs |
 | `--external-assets` | off | Allow assets from other domains (CDNs) |
@@ -167,4 +171,5 @@ Archives, executables and audio/video files (`.zip`, `.exe`, `.mp4`, `.mp3`, and
 - Pages are fetched with plain HTTP requests, so content that JavaScript renders in the browser won't be captured.
 - If you press `Ctrl+C`, the crawl stops right away. The pages saved so far stay on disk, but the index files are not written.
 - The two versions apply `--timeout` slightly differently. In Python, it's the longest the scraper waits for the server to respond or send more data. In Node.js, it's the time limit for the whole request, including the download, so very large assets may need a higher value.
+- When a request fails because of a connection problem or rate limiting, every worker pauses (not just the one that failed) and the request is retried. Lines starting with `[retry]` show this. If a site keeps blocking you, lower `--workers` and raise `--delay`.
 - Crawl responsibly. Respect `robots.txt` and the site's terms of service, and keep `--delay` and `--workers` low enough that you don't overload the server.
